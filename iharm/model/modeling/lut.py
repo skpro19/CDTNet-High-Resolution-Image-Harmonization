@@ -6,7 +6,7 @@ from torch.autograd import Variable
 import torch
 import numpy as np
 import math
-import trilinear
+# import trilinear
 import cv2
 import sys
 
@@ -355,7 +355,7 @@ class Generator3DLUT_identity(nn.Module):
                     buffer[1,i,j,k] = float(x[1])
                     buffer[2,i,j,k] = float(x[2])
         self.LUT = nn.Parameter(torch.from_numpy(buffer).requires_grad_(True))
-        self.TrilinearInterpolation = TrilinearInterpolation()
+        self.TrilinearInterpolation = TrilinearInterpolationGS()
 
     def forward(self, x):
         _, output = self.TrilinearInterpolation(self.LUT, x)
@@ -368,7 +368,7 @@ class Generator3DLUT_zero(nn.Module):
 
         self.LUT = torch.zeros(3,dim,dim,dim, dtype=torch.float)
         self.LUT = nn.Parameter(self.LUT.clone().detach().requires_grad_(True))
-        self.TrilinearInterpolation = TrilinearInterpolation()
+        self.TrilinearInterpolation = TrilinearInterpolationGS()
 
     def forward(self, x):
 

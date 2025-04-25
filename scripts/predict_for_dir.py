@@ -58,7 +58,7 @@ def main():
         image_size = image.shape
         image = cv2.resize(image, (args.hr_h, args.hr_w), cv2.INTER_LINEAR)
 
-        mask_path = osp.join(args.masks, '_'.join(image_name.split('.')[:-1])[0:-2] + '.png')
+        mask_path = osp.join(args.masks, ''.join(image_name.split('.')[:-1]) + '.png')
         mask_image = cv2.imread(mask_path).astype(np.float32) / 255
         mask_image = cv2.resize(mask_image, (args.hr_h, args.hr_w), cv2.INTER_LINEAR)
         mask = mask_image[:, :, 0]
