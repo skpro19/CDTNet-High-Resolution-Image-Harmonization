@@ -6,6 +6,10 @@
 **/__pycache__/**
 **/build/**
 CDTNet_2048_result/
+
+# data folders
 predict_images/
 predict_masks/
+module_outputs/** 
+
 
