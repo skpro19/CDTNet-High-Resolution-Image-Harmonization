@@ -113,13 +113,8 @@ scripts/
   evaluate_model_fg_ratios.py
   evaluate_model.py
   predict_for_dir.py
+  test_cdtNet_modules.py
 trilinear_cpp/
-  build/
-    temp.linux-x86_64-3.6/
-      build.ninja
-    temp.linux-x86_64-3.9/
-      .ninja_log
-      build.ninja
   src/
     trilinear_cuda.cpp
     trilinear_cuda.h
@@ -134,11 +129,13 @@ trilinear_cpp/
     top_level.txt
   setup.py
   setup.sh
+.gitignore
 config.yml
 evaluate_model.py
 predict_for_dir.py
 predict.sh
 README.md
+test_modules.sh
 test.sh
 train.py
 train.sh
@@ -2650,462 +2647,6 @@ class SEDeconvBlock(nn.Module):
         return out
 </file>
 
-<file path="iharm/model/modeling/lut.py">
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.models as models
-import torchvision.transforms as transforms
-from torch.autograd import Variable
-import torch
-import numpy as np
-import math
-import trilinear
-import cv2
-import sys
-
-def initial_luts(lut_num=3):
-    lut_list=[]
-    lut_list.append(Generator3DLUT_identity())
-    for ii in range(lut_num-1):
-        lut_list.append(Generator3DLUT_zero())
-    return lut_list
-
-
-def weights_init_normal_classifier(m):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        torch.nn.init.xavier_normal_(m.weight.data)
-
-    elif classname.find("BatchNorm2d") != -1 or classname.find("InstanceNorm2d") != -1:
-        torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
-        torch.nn.init.constant_(m.bias.data, 0.0)
-
-
-class Weight_predictor_idih(nn.Module):
-    def __init__(self, in_channels=1024,out_channels=3):
-        super(Weight_predictor_idih, self).__init__()
-
-        # self.dp = nn.Dropout(p=0.5)
-        self.mid_ch = 256
-        self.conv = nn.Conv2d(in_channels, self.mid_ch, 1, 1, padding=0)
-        self.avg_pooling = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Conv2d(self.mid_ch*2, out_channels, 1, 1, padding=0)
-
-                    
-    def forward(self, encoder_outputs, mask):
-        fea0 = encoder_outputs[0]
-        fea1 = encoder_outputs[1]
-        fea2 = encoder_outputs[2]
-        up_fea0 = F.interpolate(fea0, size=fea2.shape[2:], mode='bilinear')
-        up_fea1 = F.interpolate(fea1, size=fea2.shape[2:], mode='bilinear')
-        fea_input = torch.cat((up_fea0, up_fea1, fea2),1)
-        x = self.conv(fea_input)
-        down_mask = F.interpolate(mask, size=fea2.shape[2:], mode='bilinear')
-        fg_feature = self.avg_pooling(x*down_mask)
-        bg_feature = self.avg_pooling(x*(1-down_mask))
-        fgbg_fea = torch.cat((fg_feature, bg_feature),1)
-        x = self.fc(fgbg_fea)
-
-        return x
-    
-class Weight_predictor_issam(nn.Module):
-    def __init__(self, in_channels=256, out_channels=3, fb=True):
-        super(Weight_predictor_issam, self).__init__()
-
-        # self.dp = nn.Dropout(p=0.5)
-        self.mid_ch = 256
-        self.fb = fb
-        self.conv = nn.Conv2d(in_channels, self.mid_ch, 1, 1, padding=0)
-        self.avg_pooling = nn.AdaptiveAvgPool2d(1)
-        if self.fb:
-            # print(self.mid_ch*2)
-            self.fc = nn.Conv2d(self.mid_ch*2, out_channels, 1, 1, padding=0)
-        else:
-            # print(self.mid_ch)
-            self.fc = nn.Conv2d(self.mid_ch, out_channels, 1, 1, padding=0)
-
-                    
-    def forward(self, encoder_outputs, mask):
-        # fea0 = encoder_outputs[0]
-        # fea1 = encoder_outputs[1]
-        # fea2 = encoder_outputs[2]
-        # up_fea0 = F.interpolate(fea0, size=fea2.shape[2:], mode='bilinear')
-        # up_fea1 = F.interpolate(fea1, size=fea2.shape[2:], mode='bilinear')
-        # fea_input = torch.cat((up_fea0, up_fea1, fea2),1)
-        fea_input = encoder_outputs[0]
-        # print('fea shape', fea_input.shape)
-        x = self.conv(fea_input)
-        if self.fb:
-            down_mask = F.interpolate(mask, size=fea_input.shape[2:], mode='bilinear')
-            # print(torch.unique(down_mask))
-            fg_feature = self.avg_pooling(x*down_mask)
-            bg_feature = self.avg_pooling(x*(1-down_mask))
-            fgbg_fea = torch.cat((fg_feature, bg_feature),1)
-            x = self.fc(fgbg_fea)
-        else:
-            feature = self.avg_pooling(x)
-            x = self.fc(feature)
-        return x
-
-
-    
-class Weight_predictor_issam_w_local(nn.Module):
-    def __init__(self, in_channels=256, out_channels=3, patch_size=8, concate=True):
-        super(Weight_predictor_issam_w_local, self).__init__()
-
-        self.mid_ch = 256
-        self.patch_size = patch_size
-        self.fea_patches = []
-        self.mask_patches = []
-        self.concate = concate
-        self.out_channels = out_channels
-        self.conv = nn.Conv2d(in_channels, self.mid_ch, 1, 1, padding=0)
-        self.avg_pooling = nn.AdaptiveAvgPool2d(1)
-        if self.concate:
-            self.fc1 = nn.Conv2d(self.mid_ch*4, self.mid_ch*2, 1, 1, padding=0)
-        self.fc2 = nn.Conv2d(self.mid_ch*2, self.out_channels, 1, 1, padding=0)
-
-    def to_patch(self, tensor):
-        list = []
-        h,w = tensor.shape[-2:]
-        n_x = int(h/self.patch_size)
-        n_y = int(w/self.patch_size)
-        # print('tensor h w nx ny',h,w,n_x,n_y)
-        list.append([tensor] * (n_x * n_y))
-        # print('len(list)',len(list[0]))
-        for x in range(n_x):
-            top = x * self.patch_size
-            for y in range(n_y):
-                left = y * self.patch_size
-                one_patch = tensor[:,:,top:top+self.patch_size, left:left+self.patch_size]
-                list[0][x * n_y + y] = one_patch
-        return list, int(n_x), int(n_y)
-
-    def forward(self, encoder_outputs, mask):
-        fea_input = encoder_outputs[0]
-        down_mask = F.interpolate(mask, size=fea_input.shape[2:], mode='bilinear')
-        self.fea_patches, n_x, n_y = self.to_patch(fea_input)
-        self.mask_patches,_,_ = self.to_patch(down_mask)
-        step_x = int(mask.shape[2]/n_x)
-        step_y = int(mask.shape[3]/n_y)
-        ori_weight_map = torch.FloatTensor(np.zeros((1, self.out_channels, n_x, n_y))).cuda()
-        output_weight_map = torch.FloatTensor(np.zeros((1, self.out_channels, mask.shape[2], mask.shape[3]))).cuda()
-        # print(output_weight_map.shape,output_weight_map.device)
-        ##global
-        x = self.conv(fea_input)
-        fg_feature = self.avg_pooling(x*down_mask)
-        bg_feature = self.avg_pooling(x*(1-down_mask))
-        global_fgbg_fea = torch.cat((fg_feature, bg_feature),1)
-        ##local
-        for x in range(n_x):
-            top = x * step_x
-            for y in range(n_y):
-                left = y * step_y
-                local_fg_feature = self.avg_pooling(self.fea_patches[0][x * n_y + y]*self.mask_patches[0][x * n_y + y])
-                local_bg_feature = self.avg_pooling(self.fea_patches[0][x * n_y + y]*self.mask_patches[0][x * n_y + y])
-                local_fgbg_fea = torch.cat((local_fg_feature, local_bg_feature),1)
-                out=torch.FloatTensor(np.zeros((1,self.out_channels,1,1))).cuda()
-                if self.concate:
-                    gl_fgbg_fea = torch.cat((global_fgbg_fea, local_fgbg_fea),1)
-                    out=self.fc1(gl_fgbg_fea)
-                    out=self.fc2(out)
-                else:
-                    if (True in (self.mask_patches[0][x * n_y + y]>0)) and (True in (self.mask_patches[0][x * n_y + y]==0)):
-                        gl_fgbg_fea = (global_fgbg_fea + local_fgbg_fea)/2
-                        out=self.fc2(gl_fgbg_fea)
-                    elif (True in (self.mask_patches[0][x * n_y + y]>0)) and not (True in (self.mask_patches[0][x * n_y + y]==0)):
-                        gl_fgbg_fea = global_fgbg_fea
-                        out=self.fc2(gl_fgbg_fea)
-                    else:
-                        out=out
-                ori_weight_map[:,:,x:x+1,y:y+1] = out
-                patch_out = out.expand([1,self.out_channels,step_x,step_y])
-                # print('fea x y ii', x,y,x * n_y + y)
-                # print('pos',top,top+step_x,left,left+step_y)
-                output_weight_map[:,:,top:top+step_x,left:left+step_y] += patch_out
-        # output_weight_map = output_weight_map*mask
-        return output_weight_map, ori_weight_map
-
-class LUT_w_local(nn.Module):
-    def __init__(self, in_channels=1024, n_lut=3, backbone='issam', patch_size=8, concate=True):
-        super(LUT_w_local, self).__init__()
-        self.n_lut = n_lut
-        if self.n_lut==4:
-            self.LUT0 = Generator3DLUT_identity()
-            self.LUT1 = Generator3DLUT_zero()
-            self.LUT2 = Generator3DLUT_zero()
-            self.LUT3 = Generator3DLUT_zero()
-        self.backbone=backbone
-        if self.backbone=='issam':
-            self.classifier = Weight_predictor_issam_w_local(in_channels, n_lut, patch_size, concate)
-    def forward(self, encoder_outputs, image, mask):
-        pred_weights, ori_weight_map = self.classifier(encoder_outputs, mask) #1 4 1024 1024
-        if len(pred_weights.shape) == 1:
-            pred_weights = pred_weights.unsqueeze(0)
-        combine_A = image.new(image.size())
-        if self.n_lut==4:
-            gen_A0 = self.LUT0(image)
-            gen_A1 = self.LUT1(image)
-            gen_A2 = self.LUT2(image)
-            gen_A3 = self.LUT3(image)
-            for b in range(image.size(0)):
-                # pred_weights==0
-                combine_A[b,:,:,:] = pred_weights[b,0,:,:] * gen_A0[b,:,:,:] + pred_weights[b,1,:,:] * gen_A1[b,:,:,:]\
-                     + pred_weights[b,2,:,:] * gen_A2[b,:,:,:] + pred_weights[b,3,:,:] * gen_A3[b,:,:,:] #+ pred_weights[b,4] * gen_A4[b,:,:,:]
-        combine_A = combine_A*mask+image*(1-mask)
-
-        return combine_A, pred_weights, ori_weight_map
-
-
-class LUT(nn.Module):
-    def __init__(self, in_channels=1024, n_lut=3, backbone='issam', fb=True, clamp=False):
-        super(LUT, self).__init__()
-        self.n_lut = n_lut
-        self.fb = fb
-        self.clamp = clamp
-        # print(self.fb)
-        
-        if self.n_lut==3:
-            self.LUT0 = Generator3DLUT_identity()
-            self.LUT1 = Generator3DLUT_zero()
-            self.LUT2 = Generator3DLUT_zero()
-        elif self.n_lut==2:
-            self.LUT0 = Generator3DLUT_identity()
-            self.LUT1 = Generator3DLUT_zero()
-        elif self.n_lut==1:
-            self.LUT0 = Generator3DLUT_identity()
-        elif self.n_lut==4:
-            self.LUT0 = Generator3DLUT_identity()
-            self.LUT1 = Generator3DLUT_zero()
-            self.LUT2 = Generator3DLUT_zero()
-            self.LUT3 = Generator3DLUT_zero()
-
-        elif self.n_lut==5:
-            self.LUT0 = Generator3DLUT_identity()
-            self.LUT1 = Generator3DLUT_zero()
-            self.LUT2 = Generator3DLUT_zero()
-            self.LUT3 = Generator3DLUT_zero()
-            self.LUT4 = Generator3DLUT_zero()
-        elif self.n_lut==6:
-            self.LUT0 = Generator3DLUT_identity()
-            self.LUT1 = Generator3DLUT_zero()
-            self.LUT2 = Generator3DLUT_zero()
-            self.LUT3 = Generator3DLUT_zero()
-            self.LUT4 = Generator3DLUT_zero()
-            self.LUT5 = Generator3DLUT_zero()
-        elif self.n_lut==8:
-            self.LUT0 = Generator3DLUT_identity()
-            self.LUT1 = Generator3DLUT_zero()
-            self.LUT2 = Generator3DLUT_zero()
-            self.LUT3 = Generator3DLUT_zero()
-            self.LUT4 = Generator3DLUT_zero()
-            self.LUT5 = Generator3DLUT_zero()
-            self.LUT6 = Generator3DLUT_zero()
-            self.LUT7 = Generator3DLUT_zero()
-        # else:
-        #     self.lut_list=[]
-        #     self.lut_list=self.initial_luts(self.n_lut)
-
-        self.backbone=backbone
-        if self.backbone=='idih':
-            self.classifier = Weight_predictor_idih(in_channels, n_lut)
-        else:
-            self.classifier = Weight_predictor_issam(in_channels, n_lut, self.fb)
-
-    # def initial_luts(self, lut_num=3):
-    #     self.lut_list.append(Generator3DLUT_identity())
-    #     for ii in range(lut_num-1):
-    #         self.lut_list.append(Generator3DLUT_zero())
-    #     return self.lut_list
-
-    def forward(self, encoder_outputs, image, mask):
-        pred_weights = self.classifier(encoder_outputs, mask)
-        if len(pred_weights.shape) == 1:
-            pred_weights = pred_weights.unsqueeze(0)
-        combine_A = image.new(image.size())
-        if self.n_lut==3:
-            gen_A0 = self.LUT0(image)
-            gen_A1 = self.LUT1(image)
-            gen_A2 = self.LUT2(image)
-            for b in range(image.size(0)):
-                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:] + pred_weights[b,2] * gen_A2[b,:,:,:] #+ pred[b,3] * gen_A3[b,:,:,:] + pred[b,4] * gen_A4[b,:,:,:]
-        elif self.n_lut==2:
-            gen_A0 = self.LUT0(image)
-            gen_A1 = self.LUT1(image)
-            # combine_A = gen_A1
-            for b in range(image.size(0)):
-                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:]
-        elif self.n_lut==1:
-            gen_A0 = self.LUT0(image)
-            # combine_A = gen_A0
-            for b in range(image.size(0)):
-                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:]
-        elif self.n_lut==4:
-            gen_A0 = self.LUT0(image)
-            gen_A1 = self.LUT1(image)
-            gen_A2 = self.LUT2(image)
-            gen_A3 = self.LUT3(image)
-            for b in range(image.size(0)):
-                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:] + pred_weights[b,2] * gen_A2[b,:,:,:] \
-                    + pred_weights[b,3] * gen_A3[b,:,:,:] #+ pred_weights[b,4] * gen_A4[b,:,:,:]
-        elif self.n_lut==5:
-            gen_A0 = self.LUT0(image)
-            gen_A1 = self.LUT1(image)
-            gen_A2 = self.LUT2(image)
-            gen_A3 = self.LUT3(image)
-            gen_A4 = self.LUT4(image)
-            for b in range(image.size(0)):
-                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:] + pred_weights[b,2] * gen_A2[b,:,:,:] \
-                    + pred_weights[b,3] * gen_A3[b,:,:,:] + pred_weights[b,4] * gen_A4[b,:,:,:]
-        elif self.n_lut==6:
-            gen_A0 = self.LUT0(image)
-            gen_A1 = self.LUT1(image)
-            gen_A2 = self.LUT2(image)
-            gen_A3 = self.LUT3(image)
-            gen_A4 = self.LUT4(image)
-            gen_A5 = self.LUT5(image)
-            for b in range(image.size(0)):
-                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:] + pred_weights[b,2] * gen_A2[b,:,:,:] \
-                    + pred_weights[b,3] * gen_A3[b,:,:,:] + pred_weights[b,4] * gen_A4[b,:,:,:] + pred_weights[b,5] * gen_A5[b,:,:,:]
-        elif self.n_lut==8:
-            gen_A0 = self.LUT0(image)
-            gen_A1 = self.LUT1(image)
-            gen_A2 = self.LUT2(image)
-            gen_A3 = self.LUT3(image)
-            gen_A4 = self.LUT4(image)
-            gen_A5 = self.LUT5(image)
-            gen_A6 = self.LUT6(image)
-            gen_A7 = self.LUT7(image)
-            for b in range(image.size(0)):
-                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:] + pred_weights[b,2] * gen_A2[b,:,:,:] \
-                    + pred_weights[b,3] * gen_A3[b,:,:,:] + pred_weights[b,4] * gen_A4[b,:,:,:] + pred_weights[b,5] * gen_A5[b,:,:,:] \
-                    + pred_weights[b,6] * gen_A6[b,:,:,:] + pred_weights[b,7] * gen_A7[b,:,:,:]
-        # add the clamping
-        if self.clamp:
-            combine_A = torch.clamp(combine_A,0,1)
-
-        combine_A = combine_A*mask+image*(1-mask)
-        
-        return combine_A#,pred_weights.squeeze().detach().cpu().numpy()
-
-
-class Generator3DLUT_identity(nn.Module):
-    def __init__(self, dim=33):
-        super(Generator3DLUT_identity, self).__init__()
-        if dim == 33:
-            file = open("IdentityLUT33.txt", 'r')
-        elif dim == 64:
-            file = open("IdentityLUT64.txt", 'r')
-        lines = file.readlines()
-        buffer = np.zeros((3,dim,dim,dim), dtype=np.float32)
-
-        for i in range(0,dim):
-            for j in range(0,dim):
-                for k in range(0,dim):
-                    n = i * dim*dim + j * dim + k
-                    x = lines[n].split()
-                    buffer[0,i,j,k] = float(x[0])
-                    buffer[1,i,j,k] = float(x[1])
-                    buffer[2,i,j,k] = float(x[2])
-        self.LUT = nn.Parameter(torch.from_numpy(buffer).requires_grad_(True))
-        self.TrilinearInterpolation = TrilinearInterpolation()
-
-    def forward(self, x):
-        _, output = self.TrilinearInterpolation(self.LUT, x)
-        #self.LUT, output = self.TrilinearInterpolation(self.LUT, x)
-        return output
-
-class Generator3DLUT_zero(nn.Module):
-    def __init__(self, dim=33):
-        super(Generator3DLUT_zero, self).__init__()
-
-        self.LUT = torch.zeros(3,dim,dim,dim, dtype=torch.float)
-        self.LUT = nn.Parameter(self.LUT.clone().detach().requires_grad_(True))
-        self.TrilinearInterpolation = TrilinearInterpolation()
-
-    def forward(self, x):
-
-        _, output = self.TrilinearInterpolation(self.LUT, x)
-        return output
-
-class TrilinearInterpolationFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, lut, x):
-        x = x.contiguous()
-
-        output = x.new(x.size())
-        dim = lut.size()[-1]
-        shift = dim ** 3
-        binsize = 1.000001 / (dim-1)
-        W = x.size(2)
-        H = x.size(3)
-        batch = x.size(0)
-        
-        assert 1 == trilinear.forward(lut, 
-                                      x, 
-                                      output,
-                                      dim, 
-                                      shift, 
-                                      binsize, 
-                                      W, 
-                                      H, 
-                                      batch)
-
-        int_package = torch.IntTensor([dim, shift, W, H, batch])
-        float_package = torch.FloatTensor([binsize])
-        variables = [lut, x, int_package, float_package]
-        
-        ctx.save_for_backward(*variables)
-        
-        return lut, output
-    
-    @staticmethod
-    def backward(ctx, lut_grad, x_grad):
-        
-        lut, x, int_package, float_package = ctx.saved_variables
-        dim, shift, W, H, batch = int_package
-        dim, shift, W, H, batch = int(dim), int(shift), int(W), int(H), int(batch)
-        binsize = float(float_package[0])
-            
-        assert 1 == trilinear.backward(x, 
-                                       x_grad, 
-                                       lut_grad,
-                                       dim, 
-                                       shift, 
-                                       binsize, 
-                                       W, 
-                                       H, 
-                                       batch)
-        return lut_grad, x_grad
-
-
-class TrilinearInterpolation(torch.nn.Module):
-    def __init__(self):
-        super(TrilinearInterpolation, self).__init__()
-
-    def forward(self, lut, x):
-        return TrilinearInterpolationFunction.apply(lut, x)
-
-
-class TrilinearInterpolationGS(torch.nn.Module):
-    def __init__(self):
-        super(TrilinearInterpolationGS, self).__init__()
-
-    def forward(self, lut, img):
-        # scale im between -1 and 1 since its used as grid input in grid_sample
-        img = (img - .5) * 2.
-        # grid_sample expects NxD_outxH_outxW_outx3 (1x1xHxWx3)
-        img = img.permute(0, 2, 3, 1)[:, None]
-        # add batch dim to LUT
-        lut = lut[None] # [B,C,D_in,H_in,W_in] -> [B,3,M,M,M] 
-        # grid sample
-        result = F.grid_sample(lut, img, mode='bilinear', padding_mode='border', align_corners=True) # [B, C, D_out, H_out, W_out ]
-        # drop added dimensions and permute back
-        result = result[:, :, 0,:,:]
-        # print('after result', result.shape)
-        return lut,result
-</file>
-
 <file path="iharm/model/modeling/refine.py">
 import torch
 from torch import nn as nn
@@ -5325,62 +4866,311 @@ if __name__ == '__main__':
     main()
 </file>
 
-<file path="trilinear_cpp/build/temp.linux-x86_64-3.6/build.ninja">
-ninja_required_version = 1.3
-cxx = c++
-nvcc = /usr/local/cuda-10.2/bin/nvcc
+<file path="scripts/test_cdtNet_modules.py">
+import cv2
+import torch
+import numpy as np
+import argparse
+import os
+import os.path as osp
+from pathlib import Path
+import sys
+import yaml
+from tqdm import tqdm
+from easydict import EasyDict as edict
 
-cflags = -pthread -B /home/congwenyan/.conda/envs/pytorch/compiler_compat -Wl,--sysroot=/ -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -Wstrict-prototypes -fPIC -I/home/congwenyan/.conda/envs/pytorch/lib/python3.6/site-packages/torch/include -I/home/congwenyan/.conda/envs/pytorch/lib/python3.6/site-packages/torch/include/torch/csrc/api/include -I/home/congwenyan/.conda/envs/pytorch/lib/python3.6/site-packages/torch/include/TH -I/home/congwenyan/.conda/envs/pytorch/lib/python3.6/site-packages/torch/include/THC -I/usr/local/cuda-10.2/include -I/home/congwenyan/.conda/envs/pytorch/include/python3.6m -c
-post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=trilinear -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++14
-cuda_cflags = -I/home/congwenyan/.conda/envs/pytorch/lib/python3.6/site-packages/torch/include -I/home/congwenyan/.conda/envs/pytorch/lib/python3.6/site-packages/torch/include/torch/csrc/api/include -I/home/congwenyan/.conda/envs/pytorch/lib/python3.6/site-packages/torch/include/TH -I/home/congwenyan/.conda/envs/pytorch/lib/python3.6/site-packages/torch/include/THC -I/usr/local/cuda-10.2/include -I/home/congwenyan/.conda/envs/pytorch/include/python3.6m -c
-cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=trilinear -D_GLIBCXX_USE_CXX11_ABI=0 -gencode=arch=compute_61,code=sm_61 -std=c++14
-ldflags = 
+# Add project root to sys.path to allow imports
+sys.path.insert(0, '.')
+from iharm.model.base import CDTNet
+from iharm.inference.predictor import Predictor
+from iharm.inference.utils import load_model, find_checkpoint
+from iharm.mconfigs import ALL_MCONFIGS
+from iharm.utils.log import logger
 
-rule compile
-  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
-  depfile = $out.d
-  deps = gcc
+def load_config_file(config_path, model_name=None, return_edict=False):
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
 
-rule cuda_compile
-  command = $nvcc $cuda_cflags -c $in -o $out $cuda_post_cflags
+    if 'SUBCONFIGS' in cfg:
+        if model_name is not None and model_name in cfg['SUBCONFIGS']:
+            cfg.update(cfg['SUBCONFIGS'][model_name])
+        del cfg['SUBCONFIGS']
+
+    return edict(cfg) if return_edict else cfg
+
+def main():
+    args, cfg = parse_args()
+    
+    # Enable debug mode for more verbose output
+    if args.debug:
+        import logging
+        logger.setLevel(logging.DEBUG)
+
+    # Load model
+    device = torch.device(args.gpu)
+    checkpoint_path = find_checkpoint(cfg.MODELS_PATH, args.checkpoint)
+    model = load_model(args.model_type, checkpoint_path, verbose=True)
+    
+    # Set resolution
+    model.set_resolution(args.hr_h, args.hr_w, args.lr, False)
+    model.is_sim = args.is_sim
+    logger.debug(f"Model settings: lr={args.lr}, hr_h={args.hr_h}, hr_w={args.hr_w}, is_sim={args.is_sim}")
+    
+    # Create predictor
+    predictor = Predictor(model, device)
+
+    # Prepare output directory and subdirectories
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    final_dir = output_dir / "final"
+    lut_dir = output_dir / "lut"
+    unet_dir = output_dir / "unet"
+    final_dir.mkdir(exist_ok=True)
+    lut_dir.mkdir(exist_ok=True)
+    unet_dir.mkdir(exist_ok=True)
+
+    # Get list of images
+    image_names = os.listdir(args.images)
+    logger.info(f'Processing {len(image_names)} images from {args.images}')
+    logger.info(f'Saving outputs to {output_dir}')
+
+    for image_name in tqdm(image_names):
+        logger.debug(f"Processing image: {image_name}")
+        # Load image
+        image_path = osp.join(args.images, image_name)
+        image = cv2.imread(image_path)
+        if image is None:
+            logger.warning(f"Could not load image: {image_path}")
+            continue
+            
+        # Convert to RGB for model
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        logger.debug(f"Image shape: {image.shape}, dtype: {image.dtype}")
+        
+        # Store original size if needed
+        image_size = image.shape
+        
+        # Resize image to target resolution
+        image = cv2.resize(image, (args.hr_w, args.hr_h), cv2.INTER_LINEAR)
+        logger.debug(f"Resized image shape: {image.shape}")
+
+        # Load and process mask
+        # Try both naming conventions: same as image or image_stem.png
+        mask_path = osp.join(args.masks, image_name)
+        if not os.path.exists(mask_path):
+            mask_path = osp.join(args.masks, ''.join(image_name.split('.')[:-1]) + '.png')
+        
+        logger.debug(f"Looking for mask at: {mask_path}")
+        mask_image = cv2.imread(mask_path)
+        if mask_image is None:
+            logger.warning(f"Could not load mask: {mask_path}")
+            continue
+            
+        mask_image = mask_image.astype(np.float32) / 255
+        mask_image = cv2.resize(mask_image, (args.hr_w, args.hr_h), cv2.INTER_LINEAR)
+        mask = mask_image[:, :, 0]  # Use first channel as mask
+        logger.debug(f"Mask shape: {mask.shape}, min: {mask.min()}, max: {mask.max()}")
+        
+        # Binarize mask if needed (as in predict_for_dir.py)
+        if args.binarize_mask:
+            mask[mask <= 0.39] = 0  # ~100/255
+            mask[mask > 0.39] = 1
+            logger.debug(f"Binarized mask, min: {mask.min()}, max: {mask.max()}")
+
+        # Run prediction
+        try:
+            with torch.no_grad():
+                # Set expected return type
+                if args.extract_intermediates:
+                    logger.debug("Requesting intermediate results (return_numpy=False)")
+                    prediction = predictor.predict(image, mask, return_numpy=False)
+                    logger.debug(f"Prediction type: {type(prediction)}")
+                    if isinstance(prediction, dict):
+                        logger.debug(f"Prediction keys: {prediction.keys()}")
+                    elif torch.is_tensor(prediction):
+                        logger.debug(f"Prediction shape: {prediction.shape}")
+                else:
+                    logger.debug("Using direct prediction mode (return_numpy=True)")
+                    prediction = predictor.predict(image, mask)
+                    logger.debug(f"Prediction type: {type(prediction)}, shape: {prediction.shape if hasattr(prediction, 'shape') else 'unknown'}")
+        except Exception as e:
+            logger.error(f"Error during prediction for {image_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+        # Handle different output formats
+        try:
+            final_output_np = None
+            lut_output_np = None
+            unet_output_np = None
+            
+            if isinstance(prediction, dict) and 'images' in prediction:
+                # Handle dictionary format with intermediate results
+                logger.debug("Processing dictionary prediction format")
+                if 'images' in prediction:
+                    final_tensor = prediction['images']
+                    if isinstance(final_tensor, list):
+                        final_tensor = final_tensor[0]
+                    if torch.is_tensor(final_tensor):
+                        final_output_np = final_tensor.permute(1, 2, 0).cpu().numpy()
+                        logger.debug(f"Got final output tensor, shape: {final_output_np.shape}")
+                
+                if 'lut_images' in prediction:
+                    lut_tensor = prediction['lut_images']
+                    if isinstance(lut_tensor, list) and len(lut_tensor) > 0:
+                        lut_tensor = lut_tensor[0]
+                    if torch.is_tensor(lut_tensor):
+                        lut_output_np = lut_tensor.permute(1, 2, 0).cpu().numpy()
+                        logger.debug(f"Got LUT output tensor, shape: {lut_output_np.shape}")
+                
+                if 'base_images' in prediction:
+                    unet_tensor = prediction['base_images']
+                    if isinstance(unet_tensor, list) and len(unet_tensor) > 0:
+                        unet_tensor = unet_tensor[0]
+                    if torch.is_tensor(unet_tensor):
+                        unet_output_np = unet_tensor.permute(1, 2, 0).cpu().numpy()
+                        logger.debug(f"Got UNet output tensor, shape: {unet_output_np.shape}")
+            
+            elif torch.is_tensor(prediction):
+                # Handle tensor output directly
+                logger.debug(f"Processing tensor prediction, shape: {prediction.shape}")
+                if len(prediction.shape) == 4:  # NCHW format
+                    final_output_np = prediction[0].permute(1, 2, 0).cpu().numpy()
+                elif len(prediction.shape) == 3:  # Could be CHW or HWC format
+                    if prediction.shape[0] == 3 or prediction.shape[2] == 3:
+                        # Check which dimension is the channel dimension (likely 0 or 2)
+                        if prediction.shape[0] == 3:  # CHW format
+                            final_output_np = prediction.permute(1, 2, 0).cpu().numpy()
+                        else:  # HWC format
+                            final_output_np = prediction.cpu().numpy()
+                    else:
+                        logger.warning(f"Unexpected tensor shape: {prediction.shape}")
+                        final_output_np = prediction.cpu().numpy()
+                logger.debug(f"Converted tensor to numpy, shape: {final_output_np.shape if final_output_np is not None else 'None'}")
+            
+            elif isinstance(prediction, np.ndarray):
+                # Handle numpy array output directly
+                logger.debug(f"Processing numpy prediction, shape: {prediction.shape}")
+                final_output_np = prediction
+            
+            else:
+                logger.warning(f"Unknown prediction type: {type(prediction)}")
+                continue
+            
+            # If we still don't have a final output, skip this image
+            if final_output_np is None:
+                logger.warning("Could not extract final output from prediction.")
+                continue
+                
+            # Resize back to original if requested
+            if args.original_size and image_size != final_output_np.shape:
+                logger.debug(f"Resizing outputs back to {image_size[1]}x{image_size[0]}")
+                final_output_np = cv2.resize(final_output_np, (image_size[1], image_size[0]))
+                if lut_output_np is not None:
+                    lut_output_np = cv2.resize(lut_output_np, (image_size[1], image_size[0]))
+                if unet_output_np is not None:
+                    unet_output_np = cv2.resize(unet_output_np, (image_size[1], image_size[0]))
+            
+        except Exception as e:
+            logger.error(f"Error processing prediction for {image_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+        # Save images
+        try:
+            # Final output saved as jpg with high quality
+            logger.debug(f"Saving final output, shape: {final_output_np.shape}, min: {final_output_np.min()}, max: {final_output_np.max()}")
+            
+            # Scale values to 0-255 range if needed
+            if final_output_np.max() <= 1.0 and final_output_np.min() >= 0.0:
+                final_output_np = final_output_np * 255
+                
+            # RGB to BGR conversion for OpenCV
+            if final_output_np.shape[-1] == 3:  # If it's an RGB image
+                final_output_bgr = cv2.cvtColor(final_output_np.astype(np.uint8), cv2.COLOR_RGB2BGR)
+            else:
+                final_output_bgr = final_output_np.astype(np.uint8)
+                
+            output_final_path = final_dir / image_name
+            logger.debug(f"Saving final output to {output_final_path}")
+            cv2.imwrite(str(output_final_path), final_output_bgr, [cv2.IMWRITE_JPEG_QUALITY, 100])
+            logger.info(f"Saved final output for {image_name}")
+
+            # Save intermediate outputs if available
+            if lut_output_np is not None:
+                logger.debug(f"Saving LUT output, shape: {lut_output_np.shape}")
+                if lut_output_np.max() <= 1.0:
+                    lut_output_np = lut_output_np * 255
+                lut_output_bgr = cv2.cvtColor(lut_output_np.astype(np.uint8), cv2.COLOR_RGB2BGR)
+                output_lut_path = lut_dir / f"{os.path.splitext(image_name)[0]}.png"
+                cv2.imwrite(str(output_lut_path), lut_output_bgr)
+                logger.info(f"Saved LUT output for {image_name}")
+                
+            if unet_output_np is not None:
+                logger.debug(f"Saving UNet output, shape: {unet_output_np.shape}")
+                if unet_output_np.max() <= 1.0:
+                    unet_output_np = unet_output_np * 255
+                unet_output_bgr = cv2.cvtColor(unet_output_np.astype(np.uint8), cv2.COLOR_RGB2BGR)
+                output_unet_path = unet_dir / f"{os.path.splitext(image_name)[0]}.png"
+                cv2.imwrite(str(output_unet_path), unet_output_bgr)
+                logger.info(f"Saved UNet output for {image_name}")
+            
+        except Exception as e:
+            logger.error(f"Error saving outputs for {image_name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    logger.info(f"Processing finished. Outputs saved in subdirectories under {output_dir}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Visualize CDTNet intermediate outputs for a directory.")
+    parser.add_argument('model_type', choices=ALL_MCONFIGS.keys(), help='Type of the model')
+    parser.add_argument('checkpoint', type=str, 
+                        help='The path to the model checkpoint. '
+                             'This can be a relative path (relative to cfg.MODELS_PATH) '
+                             'or an absolute path. The file extension can be omitted.')
+    parser.add_argument('--images', type=str, required=True,
+                        help='Path to directory with .jpg images to get predictions for.')
+    parser.add_argument('--masks', type=str, required=True,
+                        help='Path to directory with .png binary masks for images.')
+    parser.add_argument('--gpu', type=str, default='cuda:0', 
+                        help='GPU device to use (e.g., cuda:0 or cpu)')
+    parser.add_argument('--output-dir', type=str, default='./module_outputs', 
+                        help='Directory to save the output images')
+    parser.add_argument('--lr', type=int, default=512, 
+                        help='Base resolution for UNet (low-res)')
+    parser.add_argument('--hr_h', type=int, default=2048, 
+                        help='Target height resolution')
+    parser.add_argument('--hr_w', type=int, default=2048, 
+                        help='Target width resolution')
+    parser.add_argument('--is_sim', action='store_true', default=False,
+                        help='Whether to use CDTNet-sim (LUT only). Default: False')
+    parser.add_argument('--original-size', action='store_true', default=False,
+                        help='Resize predicted image back to the original size.')
+    parser.add_argument('--config-path', type=str, default='./config.yml', 
+                        help='The path to the config file.')
+    parser.add_argument('--extract-intermediates', action='store_true', default=True,
+                        help='Extract intermediate results (LUT and UNet). Default: True')
+    parser.add_argument('--binarize-mask', action='store_true', default=False,
+                        help='Binarize mask like in predict_for_dir.py. Default: False')
+    parser.add_argument('--debug', action='store_true', default=False,
+                        help='Enable detailed debug output')
 
-build /home/congwenyan/our1024/trilinear_cpp/build/temp.linux-x86_64-3.6/src/trilinear_cuda.o: compile /home/congwenyan/our1024/trilinear_cpp/src/trilinear_cuda.cpp
-build /home/congwenyan/our1024/trilinear_cpp/build/temp.linux-x86_64-3.6/src/trilinear_kernel.o: cuda_compile /home/congwenyan/our1024/trilinear_cpp/src/trilinear_kernel.cu
-</file>
-
-<file path="trilinear_cpp/build/temp.linux-x86_64-3.9/.ninja_log">
-# ninja log v5
-0	5702	1685877347983449855	/home/taoxinhao/CDTNet-High-Resolution-Image-Harmonization/trilinear_cpp/build/temp.linux-x86_64-3.9/src/trilinear_kernel.o	1e1d3bd8c40c61f2
-0	19102	1685877361391416909	/home/taoxinhao/CDTNet-High-Resolution-Image-Harmonization/trilinear_cpp/build/temp.linux-x86_64-3.9/src/trilinear_cuda.o	41d8c17847f2ec1d
-</file>
-
-<file path="trilinear_cpp/build/temp.linux-x86_64-3.9/build.ninja">
-ninja_required_version = 1.3
-cxx = c++
-nvcc = /usr/local/cuda-11.4/bin/nvcc
-
-cflags = -pthread -B /home/taoxinhao/miniconda3/envs/idih/compiler_compat -Wl,--sysroot=/ -Wno-unused-result -Wsign-compare -DNDEBUG -O2 -Wall -fPIC -O2 -isystem /home/taoxinhao/miniconda3/envs/idih/include -fPIC -O2 -isystem /home/taoxinhao/miniconda3/envs/idih/include -fPIC -I/home/taoxinhao/miniconda3/envs/idih/lib/python3.9/site-packages/torch/include -I/home/taoxinhao/miniconda3/envs/idih/lib/python3.9/site-packages/torch/include/torch/csrc/api/include -I/home/taoxinhao/miniconda3/envs/idih/lib/python3.9/site-packages/torch/include/TH -I/home/taoxinhao/miniconda3/envs/idih/lib/python3.9/site-packages/torch/include/THC -I/usr/local/cuda-11.4/include -I/home/taoxinhao/miniconda3/envs/idih/include/python3.9 -c
-post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=trilinear -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++14
-cuda_cflags = -I/home/taoxinhao/miniconda3/envs/idih/lib/python3.9/site-packages/torch/include -I/home/taoxinhao/miniconda3/envs/idih/lib/python3.9/site-packages/torch/include/torch/csrc/api/include -I/home/taoxinhao/miniconda3/envs/idih/lib/python3.9/site-packages/torch/include/TH -I/home/taoxinhao/miniconda3/envs/idih/lib/python3.9/site-packages/torch/include/THC -I/usr/local/cuda-11.4/include -I/home/taoxinhao/miniconda3/envs/idih/include/python3.9 -c
-cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=trilinear -D_GLIBCXX_USE_CXX11_ABI=0 -gencode=arch=compute_86,code=compute_86 -gencode=arch=compute_86,code=sm_86 -std=c++14
-ldflags = 
-
-rule compile
-  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
-  depfile = $out.d
-  deps = gcc
-
-rule cuda_compile
-  depfile = $out.d
-  deps = gcc
-  command = $nvcc  $cuda_cflags -c $in -o $out $cuda_post_cflags
+    args = parser.parse_args()
+    cfg = load_config_file(args.config_path, return_edict=True)
+    
+    # Ensure MODELS_PATH exists in config
+    if not hasattr(cfg, 'MODELS_PATH'):
+        cfg.MODELS_PATH = './'
+    
+    return args, cfg
 
 
-
-build /home/taoxinhao/CDTNet-High-Resolution-Image-Harmonization/trilinear_cpp/build/temp.linux-x86_64-3.9/src/trilinear_cuda.o: compile /home/taoxinhao/CDTNet-High-Resolution-Image-Harmonization/trilinear_cpp/src/trilinear_cuda.cpp
-build /home/taoxinhao/CDTNet-High-Resolution-Image-Harmonization/trilinear_cpp/build/temp.linux-x86_64-3.9/src/trilinear_kernel.o: cuda_compile /home/taoxinhao/CDTNet-High-Resolution-Image-Harmonization/trilinear_cpp/src/trilinear_kernel.cu
+if __name__ == "__main__":
+    main()
 </file>
 
 <file path="trilinear_cpp/src/trilinear_cuda.cpp">
@@ -5807,18 +5597,6 @@ int trilinear_backward(torch::Tensor image, torch::Tensor image_grad, torch::Ten
 
 </file>
 
-<file path="trilinear_cpp/trilinear.egg-info/PKG-INFO">
-Metadata-Version: 2.1
-Name: trilinear
-Version: 0.0.0
-Summary: UNKNOWN
-Home-page: UNKNOWN
-License: UNKNOWN
-Platform: UNKNOWN
-
-UNKNOWN
-</file>
-
 <file path="trilinear_cpp/trilinear.egg-info/SOURCES.txt">
 setup.py
 src/trilinear_cuda.cpp
@@ -5856,10 +5634,6 @@ else:
     setup(name='trilinear',
         ext_modules=[CppExtension('trilinear', ['src/trilinear.cpp'])],
         cmdclass={'build_ext': BuildExtension})
-</file>
-
-<file path="trilinear_cpp/setup.sh">
-export CUDA_HOME=/usr/local/cuda-11.4 && python3 setup.py install
 </file>
 
 <file path="predict_for_dir.py">
@@ -5977,6 +5751,192 @@ if __name__ == '__main__':
 
 <file path="predict.sh">
 python3 scripts/predict_for_dir.py CDTNet ./HAdobe5k_2048.pth --images ./predict_images --masks ./predict_masks --gpu 0 --hr_h 2048 --hr_w 2048 --lr 512 --results-path ./CDTNet_2048_result
+</file>
+
+<file path="test_modules.sh">
+#!/bin/bash
+
+# Default values
+MODEL_TYPE="CDTNet"
+CHECKPOINT="./HAdobe5k_2048.pth"  # Example checkpoint
+IMAGE_DIR="./predict_images" # Default image directory
+MASK_DIR="./predict_masks"   # Default mask directory
+GPU="cuda:0"
+OUTPUT_DIR="./module_outputs"
+CONFIG_PATH="./config.yml"
+LR=512
+HR_H=2048
+HR_W=2048
+IS_SIM=false
+ORIGINAL_SIZE=false
+ADDITIONAL=false
+DEBUG=false
+BINARIZE_MASK=false
+
+# Parse command line arguments
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --checkpoint)
+            CHECKPOINT="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        --image-dir)
+            IMAGE_DIR="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        --mask-dir)
+            MASK_DIR="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        --gpu)
+            GPU="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        --output-dir)
+            OUTPUT_DIR="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        --config-path)
+            CONFIG_PATH="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        --lr)
+            LR="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        --hr_h)
+            HR_H="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        --hr_w)
+            HR_W="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        --is_sim)
+            IS_SIM=true
+            shift # past argument
+            ;;
+        --original-size)
+            ORIGINAL_SIZE=true
+            shift # past argument
+            ;;
+        --additional)
+            ADDITIONAL=true
+            shift # past argument
+            ;;
+        --debug)
+            DEBUG=true
+            shift # past argument
+            ;;
+        --binarize-mask)
+            BINARIZE_MASK=true
+            shift # past argument
+            ;;
+        *)
+            echo "Unknown option $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Apply additional flag settings (only if individual flags weren't explicitly set)
+if [ "$ADDITIONAL" = true ]; then
+    echo "Enabling all additional options with default values"
+    
+    # If checkpoint is HAdobe5k_2048.pth or was not explicitly set, use CDTNet_sim_base256.pth for --additional
+    if [ "$CHECKPOINT" = "./HAdobe5k_2048.pth" ]; then
+        if [ -f "./CDTNet_sim_base256.pth" ]; then
+            CHECKPOINT="./CDTNet_sim_base256.pth"
+            echo "  - Switched to sim-based checkpoint: $CHECKPOINT"
+        fi
+    fi
+    
+    # Set high-quality defaults
+    LR=512
+    HR_H=2048
+    HR_W=2048
+    IS_SIM=true
+    ORIGINAL_SIZE=true
+    DEBUG=true
+    BINARIZE_MASK=true
+    
+    echo "  - Using resolution: ${HR_W}x${HR_H} (base: $LR)"
+    echo "  - Enabled CDTNet-sim mode"
+    echo "  - Will resize outputs to original image sizes"
+    echo "  - Enabled debug output for verbose logging"
+    echo "  - Enabled mask binarization"
+fi
+
+# Check if required files exist
+if [ ! -f "$CHECKPOINT" ]; then
+    echo "Error: Checkpoint file not found: $CHECKPOINT"
+    exit 1
+fi
+if [ ! -d "$IMAGE_DIR" ]; then
+    echo "Error: Image directory not found: $IMAGE_DIR"
+    exit 1
+fi
+if [ ! -d "$MASK_DIR" ]; then
+    echo "Error: Mask directory not found: $MASK_DIR"
+    exit 1
+fi
+if [ ! -f "$CONFIG_PATH" ]; then
+    echo "Warning: Config file not found: $CONFIG_PATH"
+    echo "Will use default configuration."
+fi
+
+echo "Running module visualization for directory..."
+echo "Checkpoint: $CHECKPOINT"
+echo "Image Dir: $IMAGE_DIR"
+echo "Mask Dir: $MASK_DIR"
+echo "GPU: $GPU"
+echo "Output Dir: $OUTPUT_DIR"
+echo "Config Path: $CONFIG_PATH"
+echo "Resolution: ${HR_W}x${HR_H} (base: $LR)"
+if [ "$IS_SIM" = true ]; then
+    echo "Using CDTNet-sim mode"
+fi
+if [ "$ORIGINAL_SIZE" = true ]; then
+    echo "Will resize outputs to original image sizes"
+fi
+if [ "$DEBUG" = true ]; then
+    echo "Debug mode enabled"
+fi
+if [ "$BINARIZE_MASK" = true ]; then
+    echo "Mask binarization enabled"
+fi
+
+# Build command with required arguments
+CMD="python scripts/test_cdtNet_modules.py \"$MODEL_TYPE\" \"$CHECKPOINT\" --images \"$IMAGE_DIR\" --masks \"$MASK_DIR\" --gpu \"$GPU\" --output-dir \"$OUTPUT_DIR\" --config-path \"$CONFIG_PATH\" --lr $LR --hr_h $HR_H --hr_w $HR_W"
+
+# Add optional flags
+if [ "$IS_SIM" = true ]; then
+    CMD="$CMD --is_sim"
+fi
+if [ "$ORIGINAL_SIZE" = true ]; then
+    CMD="$CMD --original-size"
+fi
+if [ "$DEBUG" = true ]; then
+    CMD="$CMD --debug"
+fi
+if [ "$BINARIZE_MASK" = true ]; then
+    CMD="$CMD --binarize-mask"
+fi
+
+# Execute the command
+echo "Running command: $CMD"
+eval $CMD
+
+echo "Script finished. Outputs saved in $OUTPUT_DIR"
 </file>
 
 <file path="train.sh">
@@ -6199,6 +6159,462 @@ class SpatialSeparatedAttention(nn.Module):
         return output
 </file>
 
+<file path="iharm/model/modeling/lut.py">
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.autograd import Variable
+import torch
+import numpy as np
+import math
+# import trilinear
+import cv2
+import sys
+
+def initial_luts(lut_num=3):
+    lut_list=[]
+    lut_list.append(Generator3DLUT_identity())
+    for ii in range(lut_num-1):
+        lut_list.append(Generator3DLUT_zero())
+    return lut_list
+
+
+def weights_init_normal_classifier(m):
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        torch.nn.init.xavier_normal_(m.weight.data)
+
+    elif classname.find("BatchNorm2d") != -1 or classname.find("InstanceNorm2d") != -1:
+        torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
+        torch.nn.init.constant_(m.bias.data, 0.0)
+
+
+class Weight_predictor_idih(nn.Module):
+    def __init__(self, in_channels=1024,out_channels=3):
+        super(Weight_predictor_idih, self).__init__()
+
+        # self.dp = nn.Dropout(p=0.5)
+        self.mid_ch = 256
+        self.conv = nn.Conv2d(in_channels, self.mid_ch, 1, 1, padding=0)
+        self.avg_pooling = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Conv2d(self.mid_ch*2, out_channels, 1, 1, padding=0)
+
+                    
+    def forward(self, encoder_outputs, mask):
+        fea0 = encoder_outputs[0]
+        fea1 = encoder_outputs[1]
+        fea2 = encoder_outputs[2]
+        up_fea0 = F.interpolate(fea0, size=fea2.shape[2:], mode='bilinear')
+        up_fea1 = F.interpolate(fea1, size=fea2.shape[2:], mode='bilinear')
+        fea_input = torch.cat((up_fea0, up_fea1, fea2),1)
+        x = self.conv(fea_input)
+        down_mask = F.interpolate(mask, size=fea2.shape[2:], mode='bilinear')
+        fg_feature = self.avg_pooling(x*down_mask)
+        bg_feature = self.avg_pooling(x*(1-down_mask))
+        fgbg_fea = torch.cat((fg_feature, bg_feature),1)
+        x = self.fc(fgbg_fea)
+
+        return x
+    
+class Weight_predictor_issam(nn.Module):
+    def __init__(self, in_channels=256, out_channels=3, fb=True):
+        super(Weight_predictor_issam, self).__init__()
+
+        # self.dp = nn.Dropout(p=0.5)
+        self.mid_ch = 256
+        self.fb = fb
+        self.conv = nn.Conv2d(in_channels, self.mid_ch, 1, 1, padding=0)
+        self.avg_pooling = nn.AdaptiveAvgPool2d(1)
+        if self.fb:
+            # print(self.mid_ch*2)
+            self.fc = nn.Conv2d(self.mid_ch*2, out_channels, 1, 1, padding=0)
+        else:
+            # print(self.mid_ch)
+            self.fc = nn.Conv2d(self.mid_ch, out_channels, 1, 1, padding=0)
+
+                    
+    def forward(self, encoder_outputs, mask):
+        # fea0 = encoder_outputs[0]
+        # fea1 = encoder_outputs[1]
+        # fea2 = encoder_outputs[2]
+        # up_fea0 = F.interpolate(fea0, size=fea2.shape[2:], mode='bilinear')
+        # up_fea1 = F.interpolate(fea1, size=fea2.shape[2:], mode='bilinear')
+        # fea_input = torch.cat((up_fea0, up_fea1, fea2),1)
+        fea_input = encoder_outputs[0]
+        # print('fea shape', fea_input.shape)
+        x = self.conv(fea_input)
+        if self.fb:
+            down_mask = F.interpolate(mask, size=fea_input.shape[2:], mode='bilinear')
+            # print(torch.unique(down_mask))
+            fg_feature = self.avg_pooling(x*down_mask)
+            bg_feature = self.avg_pooling(x*(1-down_mask))
+            fgbg_fea = torch.cat((fg_feature, bg_feature),1)
+            x = self.fc(fgbg_fea)
+        else:
+            feature = self.avg_pooling(x)
+            x = self.fc(feature)
+        return x
+
+
+    
+class Weight_predictor_issam_w_local(nn.Module):
+    def __init__(self, in_channels=256, out_channels=3, patch_size=8, concate=True):
+        super(Weight_predictor_issam_w_local, self).__init__()
+
+        self.mid_ch = 256
+        self.patch_size = patch_size
+        self.fea_patches = []
+        self.mask_patches = []
+        self.concate = concate
+        self.out_channels = out_channels
+        self.conv = nn.Conv2d(in_channels, self.mid_ch, 1, 1, padding=0)
+        self.avg_pooling = nn.AdaptiveAvgPool2d(1)
+        if self.concate:
+            self.fc1 = nn.Conv2d(self.mid_ch*4, self.mid_ch*2, 1, 1, padding=0)
+        self.fc2 = nn.Conv2d(self.mid_ch*2, self.out_channels, 1, 1, padding=0)
+
+    def to_patch(self, tensor):
+        list = []
+        h,w = tensor.shape[-2:]
+        n_x = int(h/self.patch_size)
+        n_y = int(w/self.patch_size)
+        # print('tensor h w nx ny',h,w,n_x,n_y)
+        list.append([tensor] * (n_x * n_y))
+        # print('len(list)',len(list[0]))
+        for x in range(n_x):
+            top = x * self.patch_size
+            for y in range(n_y):
+                left = y * self.patch_size
+                one_patch = tensor[:,:,top:top+self.patch_size, left:left+self.patch_size]
+                list[0][x * n_y + y] = one_patch
+        return list, int(n_x), int(n_y)
+
+    def forward(self, encoder_outputs, mask):
+        fea_input = encoder_outputs[0]
+        down_mask = F.interpolate(mask, size=fea_input.shape[2:], mode='bilinear')
+        self.fea_patches, n_x, n_y = self.to_patch(fea_input)
+        self.mask_patches,_,_ = self.to_patch(down_mask)
+        step_x = int(mask.shape[2]/n_x)
+        step_y = int(mask.shape[3]/n_y)
+        ori_weight_map = torch.FloatTensor(np.zeros((1, self.out_channels, n_x, n_y))).cuda()
+        output_weight_map = torch.FloatTensor(np.zeros((1, self.out_channels, mask.shape[2], mask.shape[3]))).cuda()
+        # print(output_weight_map.shape,output_weight_map.device)
+        ##global
+        x = self.conv(fea_input)
+        fg_feature = self.avg_pooling(x*down_mask)
+        bg_feature = self.avg_pooling(x*(1-down_mask))
+        global_fgbg_fea = torch.cat((fg_feature, bg_feature),1)
+        ##local
+        for x in range(n_x):
+            top = x * step_x
+            for y in range(n_y):
+                left = y * step_y
+                local_fg_feature = self.avg_pooling(self.fea_patches[0][x * n_y + y]*self.mask_patches[0][x * n_y + y])
+                local_bg_feature = self.avg_pooling(self.fea_patches[0][x * n_y + y]*self.mask_patches[0][x * n_y + y])
+                local_fgbg_fea = torch.cat((local_fg_feature, local_bg_feature),1)
+                out=torch.FloatTensor(np.zeros((1,self.out_channels,1,1))).cuda()
+                if self.concate:
+                    gl_fgbg_fea = torch.cat((global_fgbg_fea, local_fgbg_fea),1)
+                    out=self.fc1(gl_fgbg_fea)
+                    out=self.fc2(out)
+                else:
+                    if (True in (self.mask_patches[0][x * n_y + y]>0)) and (True in (self.mask_patches[0][x * n_y + y]==0)):
+                        gl_fgbg_fea = (global_fgbg_fea + local_fgbg_fea)/2
+                        out=self.fc2(gl_fgbg_fea)
+                    elif (True in (self.mask_patches[0][x * n_y + y]>0)) and not (True in (self.mask_patches[0][x * n_y + y]==0)):
+                        gl_fgbg_fea = global_fgbg_fea
+                        out=self.fc2(gl_fgbg_fea)
+                    else:
+                        out=out
+                ori_weight_map[:,:,x:x+1,y:y+1] = out
+                patch_out = out.expand([1,self.out_channels,step_x,step_y])
+                # print('fea x y ii', x,y,x * n_y + y)
+                # print('pos',top,top+step_x,left,left+step_y)
+                output_weight_map[:,:,top:top+step_x,left:left+step_y] += patch_out
+        # output_weight_map = output_weight_map*mask
+        return output_weight_map, ori_weight_map
+
+class LUT_w_local(nn.Module):
+    def __init__(self, in_channels=1024, n_lut=3, backbone='issam', patch_size=8, concate=True):
+        super(LUT_w_local, self).__init__()
+        self.n_lut = n_lut
+        if self.n_lut==4:
+            self.LUT0 = Generator3DLUT_identity()
+            self.LUT1 = Generator3DLUT_zero()
+            self.LUT2 = Generator3DLUT_zero()
+            self.LUT3 = Generator3DLUT_zero()
+        self.backbone=backbone
+        if self.backbone=='issam':
+            self.classifier = Weight_predictor_issam_w_local(in_channels, n_lut, patch_size, concate)
+    def forward(self, encoder_outputs, image, mask):
+        pred_weights, ori_weight_map = self.classifier(encoder_outputs, mask) #1 4 1024 1024
+        if len(pred_weights.shape) == 1:
+            pred_weights = pred_weights.unsqueeze(0)
+        combine_A = image.new(image.size())
+        if self.n_lut==4:
+            gen_A0 = self.LUT0(image)
+            gen_A1 = self.LUT1(image)
+            gen_A2 = self.LUT2(image)
+            gen_A3 = self.LUT3(image)
+            for b in range(image.size(0)):
+                # pred_weights==0
+                combine_A[b,:,:,:] = pred_weights[b,0,:,:] * gen_A0[b,:,:,:] + pred_weights[b,1,:,:] * gen_A1[b,:,:,:]\
+                     + pred_weights[b,2,:,:] * gen_A2[b,:,:,:] + pred_weights[b,3,:,:] * gen_A3[b,:,:,:] #+ pred_weights[b,4] * gen_A4[b,:,:,:]
+        combine_A = combine_A*mask+image*(1-mask)
+
+        return combine_A, pred_weights, ori_weight_map
+
+
+class LUT(nn.Module):
+    def __init__(self, in_channels=1024, n_lut=3, backbone='issam', fb=True, clamp=False):
+        super(LUT, self).__init__()
+        self.n_lut = n_lut
+        self.fb = fb
+        self.clamp = clamp
+        # print(self.fb)
+        
+        if self.n_lut==3:
+            self.LUT0 = Generator3DLUT_identity()
+            self.LUT1 = Generator3DLUT_zero()
+            self.LUT2 = Generator3DLUT_zero()
+        elif self.n_lut==2:
+            self.LUT0 = Generator3DLUT_identity()
+            self.LUT1 = Generator3DLUT_zero()
+        elif self.n_lut==1:
+            self.LUT0 = Generator3DLUT_identity()
+        elif self.n_lut==4:
+            self.LUT0 = Generator3DLUT_identity()
+            self.LUT1 = Generator3DLUT_zero()
+            self.LUT2 = Generator3DLUT_zero()
+            self.LUT3 = Generator3DLUT_zero()
+
+        elif self.n_lut==5:
+            self.LUT0 = Generator3DLUT_identity()
+            self.LUT1 = Generator3DLUT_zero()
+            self.LUT2 = Generator3DLUT_zero()
+            self.LUT3 = Generator3DLUT_zero()
+            self.LUT4 = Generator3DLUT_zero()
+        elif self.n_lut==6:
+            self.LUT0 = Generator3DLUT_identity()
+            self.LUT1 = Generator3DLUT_zero()
+            self.LUT2 = Generator3DLUT_zero()
+            self.LUT3 = Generator3DLUT_zero()
+            self.LUT4 = Generator3DLUT_zero()
+            self.LUT5 = Generator3DLUT_zero()
+        elif self.n_lut==8:
+            self.LUT0 = Generator3DLUT_identity()
+            self.LUT1 = Generator3DLUT_zero()
+            self.LUT2 = Generator3DLUT_zero()
+            self.LUT3 = Generator3DLUT_zero()
+            self.LUT4 = Generator3DLUT_zero()
+            self.LUT5 = Generator3DLUT_zero()
+            self.LUT6 = Generator3DLUT_zero()
+            self.LUT7 = Generator3DLUT_zero()
+        # else:
+        #     self.lut_list=[]
+        #     self.lut_list=self.initial_luts(self.n_lut)
+
+        self.backbone=backbone
+        if self.backbone=='idih':
+            self.classifier = Weight_predictor_idih(in_channels, n_lut)
+        else:
+            self.classifier = Weight_predictor_issam(in_channels, n_lut, self.fb)
+
+    # def initial_luts(self, lut_num=3):
+    #     self.lut_list.append(Generator3DLUT_identity())
+    #     for ii in range(lut_num-1):
+    #         self.lut_list.append(Generator3DLUT_zero())
+    #     return self.lut_list
+
+    def forward(self, encoder_outputs, image, mask):
+        pred_weights = self.classifier(encoder_outputs, mask)
+        if len(pred_weights.shape) == 1:
+            pred_weights = pred_weights.unsqueeze(0)
+        combine_A = image.new(image.size())
+        if self.n_lut==3:
+            gen_A0 = self.LUT0(image)
+            gen_A1 = self.LUT1(image)
+            gen_A2 = self.LUT2(image)
+            for b in range(image.size(0)):
+                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:] + pred_weights[b,2] * gen_A2[b,:,:,:] #+ pred[b,3] * gen_A3[b,:,:,:] + pred[b,4] * gen_A4[b,:,:,:]
+        elif self.n_lut==2:
+            gen_A0 = self.LUT0(image)
+            gen_A1 = self.LUT1(image)
+            # combine_A = gen_A1
+            for b in range(image.size(0)):
+                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:]
+        elif self.n_lut==1:
+            gen_A0 = self.LUT0(image)
+            # combine_A = gen_A0
+            for b in range(image.size(0)):
+                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:]
+        elif self.n_lut==4:
+            gen_A0 = self.LUT0(image)
+            gen_A1 = self.LUT1(image)
+            gen_A2 = self.LUT2(image)
+            gen_A3 = self.LUT3(image)
+            for b in range(image.size(0)):
+                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:] + pred_weights[b,2] * gen_A2[b,:,:,:] \
+                    + pred_weights[b,3] * gen_A3[b,:,:,:] #+ pred_weights[b,4] * gen_A4[b,:,:,:]
+        elif self.n_lut==5:
+            gen_A0 = self.LUT0(image)
+            gen_A1 = self.LUT1(image)
+            gen_A2 = self.LUT2(image)
+            gen_A3 = self.LUT3(image)
+            gen_A4 = self.LUT4(image)
+            for b in range(image.size(0)):
+                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:] + pred_weights[b,2] * gen_A2[b,:,:,:] \
+                    + pred_weights[b,3] * gen_A3[b,:,:,:] + pred_weights[b,4] * gen_A4[b,:,:,:]
+        elif self.n_lut==6:
+            gen_A0 = self.LUT0(image)
+            gen_A1 = self.LUT1(image)
+            gen_A2 = self.LUT2(image)
+            gen_A3 = self.LUT3(image)
+            gen_A4 = self.LUT4(image)
+            gen_A5 = self.LUT5(image)
+            for b in range(image.size(0)):
+                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:] + pred_weights[b,2] * gen_A2[b,:,:,:] \
+                    + pred_weights[b,3] * gen_A3[b,:,:,:] + pred_weights[b,4] * gen_A4[b,:,:,:] + pred_weights[b,5] * gen_A5[b,:,:,:]
+        elif self.n_lut==8:
+            gen_A0 = self.LUT0(image)
+            gen_A1 = self.LUT1(image)
+            gen_A2 = self.LUT2(image)
+            gen_A3 = self.LUT3(image)
+            gen_A4 = self.LUT4(image)
+            gen_A5 = self.LUT5(image)
+            gen_A6 = self.LUT6(image)
+            gen_A7 = self.LUT7(image)
+            for b in range(image.size(0)):
+                combine_A[b,:,:,:] = pred_weights[b,0] * gen_A0[b,:,:,:] + pred_weights[b,1] * gen_A1[b,:,:,:] + pred_weights[b,2] * gen_A2[b,:,:,:] \
+                    + pred_weights[b,3] * gen_A3[b,:,:,:] + pred_weights[b,4] * gen_A4[b,:,:,:] + pred_weights[b,5] * gen_A5[b,:,:,:] \
+                    + pred_weights[b,6] * gen_A6[b,:,:,:] + pred_weights[b,7] * gen_A7[b,:,:,:]
+        # add the clamping
+        if self.clamp:
+            combine_A = torch.clamp(combine_A,0,1)
+
+        combine_A = combine_A*mask+image*(1-mask)
+        
+        return combine_A#,pred_weights.squeeze().detach().cpu().numpy()
+
+
+class Generator3DLUT_identity(nn.Module):
+    def __init__(self, dim=33):
+        super(Generator3DLUT_identity, self).__init__()
+        if dim == 33:
+            file = open("IdentityLUT33.txt", 'r')
+        elif dim == 64:
+            file = open("IdentityLUT64.txt", 'r')
+        lines = file.readlines()
+        buffer = np.zeros((3,dim,dim,dim), dtype=np.float32)
+
+        for i in range(0,dim):
+            for j in range(0,dim):
+                for k in range(0,dim):
+                    n = i * dim*dim + j * dim + k
+                    x = lines[n].split()
+                    buffer[0,i,j,k] = float(x[0])
+                    buffer[1,i,j,k] = float(x[1])
+                    buffer[2,i,j,k] = float(x[2])
+        self.LUT = nn.Parameter(torch.from_numpy(buffer).requires_grad_(True))
+        self.TrilinearInterpolation = TrilinearInterpolationGS()
+
+    def forward(self, x):
+        _, output = self.TrilinearInterpolation(self.LUT, x)
+        #self.LUT, output = self.TrilinearInterpolation(self.LUT, x)
+        return output
+
+class Generator3DLUT_zero(nn.Module):
+    def __init__(self, dim=33):
+        super(Generator3DLUT_zero, self).__init__()
+
+        self.LUT = torch.zeros(3,dim,dim,dim, dtype=torch.float)
+        self.LUT = nn.Parameter(self.LUT.clone().detach().requires_grad_(True))
+        self.TrilinearInterpolation = TrilinearInterpolationGS()
+
+    def forward(self, x):
+
+        _, output = self.TrilinearInterpolation(self.LUT, x)
+        return output
+
+class TrilinearInterpolationFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, lut, x):
+        x = x.contiguous()
+
+        output = x.new(x.size())
+        dim = lut.size()[-1]
+        shift = dim ** 3
+        binsize = 1.000001 / (dim-1)
+        W = x.size(2)
+        H = x.size(3)
+        batch = x.size(0)
+        
+        assert 1 == trilinear.forward(lut, 
+                                      x, 
+                                      output,
+                                      dim, 
+                                      shift, 
+                                      binsize, 
+                                      W, 
+                                      H, 
+                                      batch)
+
+        int_package = torch.IntTensor([dim, shift, W, H, batch])
+        float_package = torch.FloatTensor([binsize])
+        variables = [lut, x, int_package, float_package]
+        
+        ctx.save_for_backward(*variables)
+        
+        return lut, output
+    
+    @staticmethod
+    def backward(ctx, lut_grad, x_grad):
+        
+        lut, x, int_package, float_package = ctx.saved_variables
+        dim, shift, W, H, batch = int_package
+        dim, shift, W, H, batch = int(dim), int(shift), int(W), int(H), int(batch)
+        binsize = float(float_package[0])
+            
+        assert 1 == trilinear.backward(x, 
+                                       x_grad, 
+                                       lut_grad,
+                                       dim, 
+                                       shift, 
+                                       binsize, 
+                                       W, 
+                                       H, 
+                                       batch)
+        return lut_grad, x_grad
+
+
+class TrilinearInterpolation(torch.nn.Module):
+    def __init__(self):
+        super(TrilinearInterpolation, self).__init__()
+
+    def forward(self, lut, x):
+        return TrilinearInterpolationFunction.apply(lut, x)
+
+
+class TrilinearInterpolationGS(torch.nn.Module):
+    def __init__(self):
+        super(TrilinearInterpolationGS, self).__init__()
+
+    def forward(self, lut, img):
+        # scale im between -1 and 1 since its used as grid input in grid_sample
+        img = (img - .5) * 2.
+        # grid_sample expects NxD_outxH_outxW_outx3 (1x1xHxWx3)
+        img = img.permute(0, 2, 3, 1)[:, None]
+        # add batch dim to LUT
+        lut = lut[None] # [B,C,D_in,H_in,W_in] -> [B,3,M,M,M] 
+        # grid sample
+        result = F.grid_sample(lut, img, mode='bilinear', padding_mode='border', align_corners=True) # [B, C, D_out, H_out, W_out ]
+        # drop added dimensions and permute back
+        result = result[:, :, 0,:,:]
+        # print('after result', result.shape)
+        return lut,result
+</file>
+
 <file path="models/CDTNet.py">
 from functools import partial
 
@@ -6342,127 +6758,31 @@ def model_train(model, cfg, model_cfg):
         #trainer.training(epoch)
 </file>
 
-<file path="scripts/predict_for_dir.py">
-import argparse
-import os
-import os.path as osp
-from pathlib import Path
-import sys
+<file path="trilinear_cpp/trilinear.egg-info/PKG-INFO">
+Metadata-Version: 2.4
+Name: trilinear
+Version: 0.0.0
+</file>
 
-import cv2
-import numpy as np
-import torch
-from tqdm import tqdm
-import yaml
-from easydict import EasyDict as edict
+<file path="trilinear_cpp/setup.sh">
+# export CUDA_HOME=/usr/local/cuda-11.4 && python3 setup.py install
+export CUDA_HOME=/usr/local/cuda-11.7 && python3 setup.py install
+</file>
 
-sys.path.insert(0, '.')
-from iharm.inference.predictor import Predictor
-from iharm.inference.utils import load_model, find_checkpoint
-from iharm.mconfigs import ALL_MCONFIGS
-from iharm.utils.log import logger
-
-def load_config_file(config_path, model_name=None, return_edict=False):
-    with open(config_path, 'r') as f:
-        cfg = yaml.safe_load(f)
-
-    if 'SUBCONFIGS' in cfg:
-        if model_name is not None and model_name in cfg['SUBCONFIGS']:
-            cfg.update(cfg['SUBCONFIGS'][model_name])
-        del cfg['SUBCONFIGS']
-
-    return edict(cfg) if return_edict else cfg
-
-def main():
-    args, cfg = parse_args()
-
-    device = torch.device(f'cuda:{args.gpu}')
-    checkpoint_path = find_checkpoint(cfg.MODELS_PATH, args.checkpoint)
-    net = load_model(args.model_type, checkpoint_path, verbose=True)
-    net.set_resolution(args.hr_h, args.hr_w, args.lr, False)
-    net.is_sim = args.is_sim
-    predictor = Predictor(net, device)
-
-    image_names = os.listdir(args.images)
-
-    def _save_image(image_name, bgr_image):
-        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_RGB2BGR)
-        print(image_name)
-        cv2.imwrite(
-            str(cfg.RESULTS_PATH / f'{image_name}'),
-            rgb_image,
-            [cv2.IMWRITE_JPEG_QUALITY, 100]
-        )
-
-    logger.info(f'Save images to {cfg.RESULTS_PATH}')
-
-    for image_name in tqdm(image_names):
-        image_path = osp.join(args.images, image_name)
-        image = cv2.imread(image_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image_size = image.shape
-        image = cv2.resize(image, (args.hr_h, args.hr_w), cv2.INTER_LINEAR)
-
-        mask_path = osp.join(args.masks, '_'.join(image_name.split('.')[:-1])[0:-2] + '.png')
-        mask_image = cv2.imread(mask_path).astype(np.float32) / 255
-        mask_image = cv2.resize(mask_image, (args.hr_h, args.hr_w), cv2.INTER_LINEAR)
-        mask = mask_image[:, :, 0]
-        pred = predictor.predict(image, mask, return_numpy=False)
-        print(np.sum(image),np.sum(mask),float(torch.sum(pred)))
-        pred = pred.detach().cpu().numpy().astype(np.uint8)
-        pred = cv2.cvtColor(pred, cv2.COLOR_RGB2BGR)
-
-        if args.original_size:
-            pred = cv2.resize(pred, image_size[:-1][::-1])
-        _save_image(image_name, pred)
+<file path=".gitignore">
+# files
+*.pyc
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('model_type', choices=ALL_MCONFIGS.keys())
-    parser.add_argument('checkpoint', type=str,
-                        help='The path to the checkpoint. '
-                             'This can be a relative path (relative to cfg.MODELS_PATH) '
-                             'or an absolute path. The file extension can be omitted.')
-    parser.add_argument(
-        '--images', type=str,
-        help='Path to directory with .jpg images to get predictions for.'
-    )
-    parser.add_argument(
-        '--masks', type=str,
-        help='Path to directory with .png binary masks for images, named exactly like images without last _postfix.'
-    )
-    parser.add_argument('--lr', type=int, default=256, help='base resolution')
-    parser.add_argument('--hr_h', type=int, default=1024, help='target h resolution')
-    parser.add_argument('--hr_w', type=int, default=1024, help='target w resolution')
-    parser.add_argument('--is_sim', action='store_true', default=False,
-                        help='Whether use CDTNet-sim.')
-    parser.add_argument('--save_dir', type=str, default='',
-                        help='The path to the checkpoint. '
-                             'This can be a relative path (relative to cfg.MODELS_PATH) '
-                             'or an absolute path. The file extension can be omitted.')
-    parser.add_argument(
-        '--original-size', action='store_true', default=False,
-        help='Resize predicted image back to the original size.'
-    )
-    parser.add_argument('--gpu', type=str, default=0, help='ID of used GPU.')
-    parser.add_argument('--config-path', type=str, default='./config.yml', help='The path to the config file.')
-    parser.add_argument(
-        '--results-path', type=str, default='',
-        help='The path to the harmonized images. Default path: cfg.EXPS_PATH/predictions.'
-    )
+# folders
+**/__pycache__/**
+**/build/**
+CDTNet_2048_result/
 
-    args = parser.parse_args()
-    cfg = load_config_file(args.config_path, return_edict=True)
-    cfg.EXPS_PATH = Path(cfg.EXPS_PATH)
-    cfg.RESULTS_PATH = Path(args.results_path) if len(args.results_path) else cfg.EXPS_PATH / 'predictions'
-    cfg.RESULTS_PATH.mkdir(parents=True, exist_ok=True)
-    logger.info(cfg)
-    return args, cfg
-
-
-if __name__ == '__main__':
-    main()
+# data folders
+predict_images/
+predict_masks/
+module_outputs/**
 </file>
 
 <file path="config.yml">
@@ -6699,6 +7019,129 @@ if __name__ == '__main__':
 
     #start training!
     model_name.train(cfg)
+</file>
+
+<file path="scripts/predict_for_dir.py">
+import argparse
+import os
+import os.path as osp
+from pathlib import Path
+import sys
+
+import cv2
+import numpy as np
+import torch
+from tqdm import tqdm
+import yaml
+from easydict import EasyDict as edict
+
+sys.path.insert(0, '.')
+from iharm.inference.predictor import Predictor
+from iharm.inference.utils import load_model, find_checkpoint
+from iharm.mconfigs import ALL_MCONFIGS
+from iharm.utils.log import logger
+
+def load_config_file(config_path, model_name=None, return_edict=False):
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+
+    if 'SUBCONFIGS' in cfg:
+        if model_name is not None and model_name in cfg['SUBCONFIGS']:
+            cfg.update(cfg['SUBCONFIGS'][model_name])
+        del cfg['SUBCONFIGS']
+
+    return edict(cfg) if return_edict else cfg
+
+def main():
+    args, cfg = parse_args()
+
+    device = torch.device(f'cuda:{args.gpu}')
+    checkpoint_path = find_checkpoint(cfg.MODELS_PATH, args.checkpoint)
+    net = load_model(args.model_type, checkpoint_path, verbose=True)
+    net.set_resolution(args.hr_h, args.hr_w, args.lr, False)
+    net.is_sim = args.is_sim
+    predictor = Predictor(net, device)
+
+    image_names = os.listdir(args.images)
+
+    def _save_image(image_name, bgr_image):
+        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_RGB2BGR)
+        print(image_name)
+        cv2.imwrite(
+            str(cfg.RESULTS_PATH / f'{image_name}'),
+            rgb_image,
+            [cv2.IMWRITE_JPEG_QUALITY, 100]
+        )
+
+    logger.info(f'Save images to {cfg.RESULTS_PATH}')
+
+    for image_name in tqdm(image_names):
+        image_path = osp.join(args.images, image_name)
+        image = cv2.imread(image_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image_size = image.shape
+        image = cv2.resize(image, (args.hr_h, args.hr_w), cv2.INTER_LINEAR)
+
+        mask_path = osp.join(args.masks, ''.join(image_name.split('.')[:-1]) + '.png')
+        mask_image = cv2.imread(mask_path).astype(np.float32) / 255
+        mask_image = cv2.resize(mask_image, (args.hr_h, args.hr_w), cv2.INTER_LINEAR)
+        mask = mask_image[:, :, 0]
+        pred = predictor.predict(image, mask, return_numpy=False)
+        print(np.sum(image),np.sum(mask),float(torch.sum(pred)))
+        pred = pred.detach().cpu().numpy().astype(np.uint8)
+        pred = cv2.cvtColor(pred, cv2.COLOR_RGB2BGR)
+
+        if args.original_size:
+            pred = cv2.resize(pred, image_size[:-1][::-1])
+        _save_image(image_name, pred)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('model_type', choices=ALL_MCONFIGS.keys())
+    parser.add_argument('checkpoint', type=str,
+                        help='The path to the checkpoint. '
+                             'This can be a relative path (relative to cfg.MODELS_PATH) '
+                             'or an absolute path. The file extension can be omitted.')
+    parser.add_argument(
+        '--images', type=str,
+        help='Path to directory with .jpg images to get predictions for.'
+    )
+    parser.add_argument(
+        '--masks', type=str,
+        help='Path to directory with .png binary masks for images, named exactly like images without last _postfix.'
+    )
+    parser.add_argument('--lr', type=int, default=256, help='base resolution')
+    parser.add_argument('--hr_h', type=int, default=1024, help='target h resolution')
+    parser.add_argument('--hr_w', type=int, default=1024, help='target w resolution')
+    parser.add_argument('--is_sim', action='store_true', default=False,
+                        help='Whether use CDTNet-sim.')
+    parser.add_argument('--save_dir', type=str, default='',
+                        help='The path to the checkpoint. '
+                             'This can be a relative path (relative to cfg.MODELS_PATH) '
+                             'or an absolute path. The file extension can be omitted.')
+    parser.add_argument(
+        '--original-size', action='store_true', default=False,
+        help='Resize predicted image back to the original size.'
+    )
+    parser.add_argument('--gpu', type=str, default=0, help='ID of used GPU.')
+    parser.add_argument('--config-path', type=str, default='./config.yml', help='The path to the config file.')
+    parser.add_argument(
+        '--results-path', type=str, default='',
+        help='The path to the harmonized images. Default path: cfg.EXPS_PATH/predictions.'
+    )
+
+    args = parser.parse_args()
+    cfg = load_config_file(args.config_path, return_edict=True)
+    cfg.EXPS_PATH = Path(cfg.EXPS_PATH)
+    cfg.RESULTS_PATH = Path(args.results_path) if len(args.results_path) else cfg.EXPS_PATH / 'predictions'
+    cfg.RESULTS_PATH.mkdir(parents=True, exist_ok=True)
+    logger.info(cfg)
+    return args, cfg
+
+
+if __name__ == '__main__':
+    main()
 </file>
 
 <file path="README.md">
